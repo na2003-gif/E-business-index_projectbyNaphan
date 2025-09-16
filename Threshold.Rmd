@@ -1,0 +1,669 @@
+---
+sửa code gọn lại, không quá công kềnh và lặp lại ---
+title: "Panel Threshold"
+author: phanngocanhasd@gmail.com
+output: html_document
+---
+```{r}
+
+install.packages(c("sf", "rnaturalearth", "rnaturalearthdata"))
+install.packages("devtools")
+devtools::install_github("ropensci/rnaturalearthhires")
+install.packages("plotly")
+```
+
+```{r setup, message=FALSE, warning=FALSE}
+# ===== Packages =====
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(purrr); library(stringr)
+  library(readr); library(readxl); library(janitor)
+  library(plm); library(lmtest); library(sandwich)
+  library(ggplot2); library(tibble)
+})
+# ===== 1) Data =====
+df<-Full_data_5_na_m_longtitude_
+df_raw<-df
+stopifnot(exists("df_raw"))         
+
+clean_names2 <- function(x){
+  x %>% stringr::str_replace_all("&","and") %>%
+    stringr::str_replace_all("[^A-Za-z0-9]+","_") %>%
+    stringr::str_to_lower() %>%
+    stringr::str_replace_all("_+","_") %>%
+    (\(s) stringr::str_replace(s, "^_",""))() %>%
+    (\(s) stringr::str_replace(s, "_$",""))()
+}
+names(df_raw) <- clean_names2(names(df_raw))
+
+
+pick_first <- function(df, pat){
+  cand <- grep(pat, names(df), value=TRUE, ignore.case=TRUE)
+  if(length(cand)) cand[1] else NA_character_
+}
+keys <- c(
+  province="prov|tinh|province", year="^year$|nam",
+  pbr="^pbr$|budget|revenue", ebi="^ebi$|e_business", 
+  population="^pop|population", unemployment="unemploy",
+  grdp="^grdp$|gdp_reg|rgdp"
+)
+map_cols <- lapply(keys, pick_first, df=df_raw)
+if(anyNA(unlist(map_cols))) stop("Thiếu cột: ", 
+  paste(names(map_cols)[is.na(unlist(map_cols))], collapse=", "))
+
+df <- df_raw %>%
+  transmute(
+    province     = .data[[map_cols$province]],
+    year         = as.integer(.data[[map_cols$year]]),
+    pbr          = as.numeric(.data[[map_cols$pbr]]),
+    ebi          = as.numeric(.data[[map_cols$ebi]]),
+    population   = as.numeric(.data[[map_cols$population]]),
+    unemployment = as.numeric(.data[[map_cols$unemployment]]),
+    grdp         = as.numeric(.data[[map_cols$grdp]])
+  ) %>%
+  mutate(
+    province = as.character(province),
+    log_pop  = log(population),
+    log_grdp = log(grdp)
+  ) %>%
+  drop_na(province, year, pbr, ebi, log_pop, unemployment, log_grdp) %>%
+  arrange(province, year)
+
+# Panel cân bằng
+yrs <- sort(unique(df$year))
+prov_full <- df %>% group_by(province) %>% 
+  summarise(ok = all(yrs %in% year), .groups="drop") %>% 
+  filter(ok) %>% pull(province)
+df  <- df %>% filter(province %in% prov_full) %>% arrange(province, year)
+
+pdf <- pdata.frame(df, index=c("province","year"))
+```
+
+```{r Davirst testing}
+
+suppressPackageStartupMessages({
+  library(dplyr); library(segmented)
+})
+
+if (!"log_pop" %in% names(df))  df <- df %>% mutate(log_pop = log(Population))
+if (!"log_grdp" %in% names(df)) df <- df %>% mutate(log_grdp = log(GRDP))
+
+df_use <- df %>%
+  filter(is.finite(pbr), is.finite(ebi), is.finite(log_pop),
+         is.finite(unemployment), is.finite(log_grdp)) %>%
+  mutate(province = as.factor(province),
+         year     = as.factor(year))
+
+# ==== FE model ====
+form_fe <- pbr ~ ebi + log_pop + unemployment + log_grdp + factor(year)
+
+lm_fe <- lm(form_fe, data = df_use)
+
+# ==== Davies test ====
+dv <- segmented::davies.test(lm_fe, seg.Z = ~ ebi)
+print(dv)
+```
+```{r Reset testing}
+library(lmtest)
+
+lm_fe <- lm(form_fe, data = df)
+
+# Ramsey RESET test (kiểm định dạng hàm, bỏ sót biến phi tuyến)
+reset_res <- resettest(lm_fe, power = 2:3, type = "fitted")
+
+print(reset_res)
+```
+
+```{r Result Model with Threshold}
+# ======= Result threhold (1-regime)) ======= 
+# (1) Xóa định nghĩa cũ nếu có
+if (exists("fe_at_tau")) rm(fe_at_tau)
+
+# (2) Định nghĩa lại fe_at_tau có maxlag
+fe_at_tau <- function(pdf, tau,
+                      dep = "pbr", x = "ebi",
+                      ctrls = c("log_pop","unemployment","log_grdp"),
+                      add_time_fe = TRUE,
+                      dk = TRUE, maxlag = 1) {
+  z <- as.data.frame(pdf)
+  z$x_pos <- pmax(z[[x]] - tau, 0)
+  rhs <- paste(c(x, "x_pos", ctrls, if (add_time_fe) "factor(year)"), collapse = " + ")
+  form <- as.formula(paste0(dep, " ~ ", rhs))
+  mod  <- plm::plm(form, data = plm::pdata.frame(z, index = c("province","year")),
+                   model = "within", effect = "individual")
+  ssr  <- sum(residuals(mod)^2, na.rm = TRUE)
+
+  # Driscoll–Kraay từ package plm
+  V <- if (dk) plm::vcovSCC(mod, type = "HC3", maxlag = maxlag) 
+       else     plm::vcovHC(mod, type = "HC3", cluster = "group")
+
+  ct <- lmtest::coeftest(mod, vcov = V)
+  list(model = mod, coeftest = ct, ssr = ssr, tau = tau)
+}
+search <- find_tau(pdf,
+                   dep = "pbr", x = "ebi",
+                   ctrls = c("log_pop","unemployment","log_grdp"),
+                   q_low = 0.15, q_high = 0.90, n_grid = 100,
+                   add_time_fe = TRUE, dk = TRUE)  # bỏ maxlag
+
+best_tau <- search$best$tau
+cat(sprintf("\n>>> tau-hat (EBI) = %.2f\n", best_tau))
+print(search$best$coeftest)
+
+ct <- search$best$coeftest
+b1 <- if("ebi"   %in% rownames(ct)) unname(ct["ebi","Estimate"]) else NA_real_
+b2 <- if("x_pos" %in% rownames(ct)) unname(ct["x_pos","Estimate"]) else NA_real_
+cat(sprintf("\nSlope below tau : %.0f\n", b1))
+cat(sprintf("Slope above tau : %.0f\n", b1 + b2))
+
+ggplot(search$grid, aes(tau, ssr)) +
+  geom_line() + geom_vline(xintercept = best_tau, linetype=2, color="#c0392b") +
+  labs(title="Grid search for threshold (EBI)", x="tau", y="Within-SSR") +
+  theme_minimal()
+
+# ======================
+# 8) Wild-cluster bootstrap test at 1 tau-hat (H0: x_pos = 0)
+# ======================
+boot_tauhat <- function(pdf, tau_hat, dep="pbr", x="ebi",
+                        ctrls=c("log_pop","unemployment","log_grdp"),
+                        add_time_fe=TRUE, B=499, dk=TRUE, maxlag=1) 
+
+cat(sprintf("\nBootstrap p-value (H0: no threshold at tau-hat) = %.4f\n", boot_tauhat$p_boot))
+```
+
+
+```{r Testing 2 threshold}
+get_vcov_plm <- function(mod, dk = TRUE, maxlag = 1) {
+  if (dk) {
+    # Driscoll–Kraay (plm)
+    plm::vcovSCC(mod, type = "HC3", maxlag = maxlag)
+  } else {
+    # Cluster-robust theo nhóm (plm)
+    plm::vcovHC(mod, type = "HC3", cluster = "group")
+  }
+}
+
+fe_at_two_tau <- function(pdf, tau1, tau2,
+                          dep="pbr", x="ebi",
+                          ctrls=c("log_pop","unemployment","log_grdp"),
+                          add_time_fe=TRUE, dk=TRUE, maxlag=1){
+  z <- as.data.frame(pdf)
+  t1 <- min(tau1, tau2); t2 <- max(tau1, tau2)
+  z$x_pos1 <- pmax(z[[x]] - t1, 0)
+  z$x_pos2 <- pmax(z[[x]] - t2, 0)
+  rhs <- paste(c(x, "x_pos1", "x_pos2", ctrls, if (add_time_fe) "factor(year)"),
+               collapse=" + ")
+  form <- as.formula(paste0(dep, " ~ ", rhs))
+
+  mod <- plm::plm(form,
+                  data = plm::pdata.frame(z, index=c("province","year")),
+                  model = "within", effect = "individual")
+
+  ssr <- sum(residuals(mod)^2, na.rm=TRUE)
+  V   <- get_vcov_plm(mod, dk = dk, maxlag = maxlag)
+  ct  <- lmtest::coeftest(mod, vcov = V)
+  list(model=mod, coeftest=ct, ssr=ssr, tau1=t1, tau2=t2)
+}
+find_two_tau <- function(pdf, dep="pbr", x="ebi",
+                         ctrls=c("log_pop","unemployment","log_grdp"),
+                         q_low=0.15, q_high=0.85, n_grid=100,
+                         add_time_fe=TRUE, dk=TRUE, maxlag=1,
+                         progress=TRUE){
+  xv <- as.numeric(pdf[[x]])
+  lo <- stats::quantile(xv, q_low,  na.rm=TRUE)
+  hi <- stats::quantile(xv, q_high, na.rm=TRUE)
+  taus <- seq(lo, hi, length.out=n_grid)
+
+  best <- NULL; best_ssr <- Inf
+  ssr_mat <- matrix(NA_real_, n_grid, n_grid,
+                    dimnames=list(sprintf("%.2f", taus), sprintf("%.2f", taus)))
+
+  for(i in 1:(n_grid-1)){
+    for(j in (i+1):n_grid){
+      fit <- fe_at_two_tau(pdf, taus[i], taus[j], dep, x, ctrls, add_time_fe, dk, maxlag)
+      ssr_mat[i,j] <- fit$ssr
+      if(fit$ssr < best_ssr){ best <- fit; best_ssr <- fit$ssr }
+    }
+    if(progress) message(sprintf("row %d/%d done", i, n_grid-1))
+  }
+  list(taus=taus, ssr_mat=ssr_mat, best=best)
+}
+
+get_three_slopes <- function(ct){
+  b_x   <- if("ebi"    %in% rownames(ct)) unname(ct["ebi","Estimate"])    else NA_real_
+  b_p1  <- if("x_pos1" %in% rownames(ct)) unname(ct["x_pos1","Estimate"]) else NA_real_
+  b_p2  <- if("x_pos2" %in% rownames(ct)) unname(ct["x_pos2","Estimate"]) else NA_real_
+  # Regimes: ≤τ1: b_x ; (τ1,τ2]: b_x + b_p1 ; >τ2: b_x + b_p2
+  c(slope_L = b_x,
+    slope_M = b_x + b_p1,
+    slope_H = b_x + b_p2)
+}
+
+set.seed(42)
+search2 <- find_two_tau(pdf,
+                        dep="pbr", x="ebi",
+                        ctrls=c("log_pop","unemployment","log_grdp"),
+                        q_low=0.15, q_high=0.85, n_grid=100,
+                        add_time_fe=TRUE, dk=TRUE, maxlag=1)
+
+cat(sprintf("\n>>> Best two-thresholds: tau1=%.3f, tau2=%.3f\n",
+            search2$best$tau1, search2$best$tau2))
+print(search2$best$coeftest)
+
+slopes <- get_three_slopes(search2$best$coeftest)
+cat(sprintf("\nSlopes by regime (ΔPBR/ΔEBI):\n  ≤ tau1 : %.0f\n  (tau1,tau2]: %.0f\n  > tau2 : %.0f\n",
+            slopes[1], slopes[2], slopes[3]))
+
+#Plot 
+library(ggplot2)
+library(tidyr)
+ssr_df <- as.data.frame(search2$ssr_mat)
+ssr_df$tau1 <- search2$taus
+ssr_long <- tidyr::pivot_longer(ssr_df, -tau1, names_to="tau2_chr", values_to="ssr")
+ssr_long <- ssr_long %>%
+  mutate(tau2 = as.numeric(tau2_chr),
+         tau1 = as.numeric(tau1)) %>%
+  filter(is.finite(ssr))   # chỉ phần tam giác trên
+
+ggplot(ssr_long, aes(tau1, tau2, fill = ssr)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  labs(title="Within-SSR over (tau1, tau2)", x="tau1", y="tau2", fill="SSR") +
+  theme_minimal()
+
+
+regime_sizes_2 <- function(df, x="ebi", tau1, tau2){
+  t1 <- min(tau1,tau2); t2 <- max(tau1,tau2)
+  z <- df[,c("province","year",x)]; names(z)[3] <- "x"
+  z$regime <- cut(z$x, breaks=c(-Inf,t1,t2,Inf),
+                  labels=c(paste0("≤ τ1 (", round(t1,2), ")"),
+                           paste0("(τ1, τ2] (", round(t1,2), ", ", round(t2,2), "]"),
+                           paste0("> τ2 (", round(t2,2), ")")))
+  tab <- as.data.frame(table(z$regime)); names(tab) <- c("Regime","N")
+  tab$Share <- round(tab$N/sum(tab$N), 4)
+  tab
+}
+
+sizes2 <- regime_sizes_2(as.data.frame(pdf), x="ebi",
+                         tau1=search2$best$tau1, tau2=search2$best$tau2)
+print(sizes2)
+```
+
+```{r Province with tau 31.4}
+suppressPackageStartupMessages({library(dplyr); library(ggplot2); library(stringr)})
+
+# Lấy dữ liệu chuẩn hoá nhanh (nếu đã có d0/d1 thì bỏ đoạn get_df_std)
+get_df_std <- function() {
+  z <- if (exists("pdf")) as.data.frame(pdf) else if (exists("df")) df else Data_3_na_m_logtitude_lagtitude_
+  nms <- names(z); names(z) <- tolower(nms)
+  prov <- grep("^prov|^province$", names(z), value = TRUE)[1]
+  yr   <- grep("^year$", names(z), value = TRUE)[1]
+  ebi  <- grep("^ebi$", names(z), value = TRUE)[1]
+  stopifnot(!is.na(prov), !is.na(yr), !is.na(ebi))
+  z |>
+    transmute(province = .data[[prov]] |> as.character(),
+              year     = .data[[yr]]   |> as.integer(),
+              ebi      = as.numeric(.data[[ebi]])) |>
+    filter(is.finite(ebi))
+}
+
+d0 <- get_df_std()
+
+# ---- Đặt ngưỡng & gắn cờ
+thr <- 31.20
+d1 <- d0 |> mutate(flag_low = ebi < thr)
+
+# ---- Đếm số năm dưới ngưỡng theo tỉnh
+summ_prov <- d1 |>
+  group_by(province) |>
+  summarise(n_obs = n(),
+            n_low = sum(flag_low),
+            .groups = "drop") |>
+  mutate(tag_5 = n_low == 5)
+
+# ---- In đúng các tỉnh có 5 năm dưới ngưỡng
+cat("== Provinces with EXACTLY 5 years having EBI <", thr, "==\n")
+print(summ_prov |> filter(tag_5) |> arrange(province))
+
+# (tuỳ chọn) biểu đồ thanh, tô màu riêng các tỉnh n_low == 5
+p_bar_5 <- summ_prov |>
+  filter(n_low > 0) |>
+  mutate(province = reorder(province, n_low)) |>
+  ggplot(aes(x = n_low, y = province, fill = tag_5)) +
+  geom_col() +
+  scale_fill_manual(values = c(`TRUE` = "#b71c1c", `FALSE` = "#2e7d32"),
+                    labels = c("FALSE"="khác 5 năm", "TRUE"="đúng 5 năm"),
+                    name = NULL) +
+  labs(title = paste0("Số năm EBI <", thr, " theo tỉnh"),
+       x = "Số năm dưới ngưỡng", y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+print(p_bar_5)
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr); library(ggplot2); library(sf)
+  library(rnaturalearth); library(stringi)
+})
+
+# ==== NGƯỠNG & DỮ LIỆU ====
+thr <- 31.20
+summ <- df %>%
+  filter(is.finite(ebi), !is.na(province), !is.na(year)) %>%
+  group_by(province) %>%
+  summarise(n_low = sum(ebi < thr, na.rm = TRUE), .groups = "drop") %>%
+  mutate(n_low_capped = pmin(n_low, 5L),
+         cls = factor(n_low_capped, levels = 0:5, labels = 0:5))
+
+# ==== SHAPEFILE VIỆT NAM ====
+vn <- rnaturalearth::ne_states(country = "Vietnam", returnclass = "sf")
+
+# ==== Chuẩn hóa tên: bỏ dấu, lowercase ====
+clean_name <- function(s) {
+  s %>%
+    stringi::stri_trans_general("Latin-ASCII") %>% # bỏ dấu
+    trimws()
+}
+
+vn <- vn %>% mutate(name_clean = clean_name(name))
+summ <- summ %>% mutate(name_clean = clean_name(province))
+
+# ==== JOIN ====
+vn_map <- vn %>% left_join(summ, by = "name_clean")
+
+# ==== TỌA ĐỘ DÁN NHÃN ====
+lab_pts_all <- st_point_on_surface(vn_map) %>% filter(!is.na(cls))
+lab_pts_5   <- lab_pts_all %>% filter(cls == "5")  # chỉ tỉnh có 5 năm dưới ngưỡng
+
+# ==== BẢNG MÀU ====
+pal <- c(
+  "0" = "#FADBD8",
+  "1" = "#F5B7B1",
+  "2" = "#FF9999",
+  "3" = "#EC7063",
+  "4" = "#CB4335",
+  "5" = "#922B21"
+)
+
+
+# ==== VẼ BẢN ĐỒ + NHÃN ====
+ggplot(vn_map) +
+  geom_sf(aes(fill = cls), color = "grey60", size = 0.2) +
+  geom_sf_text(data = lab_pts_all, aes(label = name_clean),
+               size = 2.6, color = "black", check_overlap = TRUE) +
+  # Nếu chỉ muốn nhãn tỉnh có đúng 5 năm dưới ngưỡng thì dùng:
+  # geom_sf_text(data = lab_pts_5, aes(label = name_clean),
+  #              size = 3, color = "black", fontface = "bold") +
+  scale_fill_manual(
+    values = pal, drop = FALSE, na.value = "grey90",
+    name = paste0("EBI < ", thr),
+    labels = c("0"="0 year","1"="1","2"="2","3"="3","4"="4","5"="5+")
+  ) +
+  coord_sf(xlim = c(102, 110), ylim = c(8, 24), expand = FALSE) +
+  labs(title = paste0("Provinces with EBI < ", thr),
+       x = "Longitude", y = "Latitude") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+```
+```{r echo=TRUE}
+suppressPackageStartupMessages({
+  library(dplyr); library(plotly)
+})
+
+plot3d_threshold <- function(df,
+                             tau = 31.23,
+                             y   = "PBR",
+                             x   = "EBI",
+                             ctrls = c("log_Population","Unemployment","log_GRDP"),
+                             use_fe = TRUE) {
+
+  need <- c("Province","Year",y,x)
+  stopifnot(all(need %in% names(df)))
+
+  # Dữ liệu gọn, factor FE
+  d <- df %>%
+    dplyr::select(Province, Year, !!y, !!x, tidyselect::any_of(ctrls)) %>%
+    mutate(Province = factor(Province),
+           Year     = factor(Year)) %>%
+    filter(is.finite(.data[[y]]), is.finite(.data[[x]]))
+
+  # Biến piecewise
+  d$x_pos <- pmax(d[[x]] - tau, 0)
+  reg_lbl <- ifelse(d[[x]] > tau, "Regime = 1 (EBI>τ)", "Regime = 0 (EBI≤τ)")
+  d$regime01 <- as.integer(d[[x]] > tau)
+
+  # Công thức hồi quy: y ~ x + x_pos + ctrls + FE
+  rhs <- c(x, "x_pos", intersect(ctrls, names(d)),
+           if (use_fe) "Province", if (use_fe) "Year")
+  form <- as.formula(paste(y, "~", paste(rhs, collapse = " + ")))
+
+  m <- lm(form, data = d)
+
+  # ======= Hai mặt phẳng fitted cho Z=0 và Z=1 =======
+  # grid X theo percentiles để tránh outlier
+  xgrid <- seq(quantile(d[[x]], .02, na.rm=TRUE),
+               quantile(d[[x]], .98, na.rm=TRUE), length.out = 80)
+
+  # newdata "điển hình": controls = mean, FE = level đầu tiên
+  proto <- d[1, , drop = FALSE]
+  proto[ ,] <- NA
+  proto$Province <- levels(d$Province)[1]
+  proto$Year     <- levels(d$Year)[1]
+  for (c in intersect(ctrls, names(d))) proto[[c]] <- mean(d[[c]], na.rm = TRUE)
+
+  # Z=0: x_pos=0
+  nd0 <- do.call(rbind, lapply(xgrid, function(v){
+    row <- proto
+    row[[x]] <- v
+    row$x_pos <- 0
+    row
+  }))
+  y0 <- as.numeric(predict(m, newdata = nd0))
+
+  # Z=1: x_pos = x - tau (chỉ có ý nghĩa khi v>tau nhưng để dựng mặt phẳng,
+  # ta vẫn cho chạy toàn bộ; trực quan vẫn tốt vì mặt phẳng nằm ở Z=1)
+  nd1 <- do.call(rbind, lapply(xgrid, function(v){
+    row <- proto
+    row[[x]] <- v
+    row$x_pos <- pmax(v - tau, 0)
+    row
+  }))
+  y1 <- as.numeric(predict(m, newdata = nd1))
+
+  # Plotly: scatter 3D + hai surface (Z hằng 0 và 1)
+  p <- plot_ly()
+
+  # Điểm thực tế
+  p <- add_markers(
+    p,
+    data = d,
+    x = ~ .data[[x]],
+    y = ~ .data[[y]],
+    z = ~ regime01,
+    color = ~ reg_lbl,
+    colors = c("#2E7D32", "#C62828"),
+    marker = list(size = 4, opacity = 0.7),
+    hovertemplate = paste(
+      "Province: %{text}<br>",
+      "EBI: %{x:.2f}<br>",
+      "PBR: %{y:.0f}<br>",
+      "Regime: %{marker.color}<extra></extra>"
+    ),
+    text = ~ as.character(Province)
+  )
+
+  # Mặt phẳng fitted cho Regime 0 (Z=0)
+  Z0 <- matrix(0,  nrow = length(y0), ncol = length(xgrid))
+  Y0 <- matrix(y0, nrow = length(y0), ncol = length(xgrid))
+  p <- add_surface(
+    p, x = xgrid, y = y0, z = Z0,
+    showscale = FALSE, opacity = 0.45,
+    surfacecolor = Y0, colorscale = "Greens",
+    name = "Fitted plane (Regime 0)"
+  )
+
+  # Mặt phẳng fitted cho Regime 1 (Z=1)
+  Z1 <- matrix(1,  nrow = length(y1), ncol = length(xgrid))
+  Y1 <- matrix(y1, nrow = length(y1), ncol = length(xgrid))
+  p <- add_surface(
+    p, x = xgrid, y = y1, z = Z1,
+    showscale = FALSE, opacity = 0.45,
+    surfacecolor = Y1, colorscale = "Reds",
+    name = "Fitted plane (Regime 1)"
+  )
+
+  p <- layout(
+    p,
+    scene = list(
+      xaxis = list(title = "EBI"),
+      yaxis = list(title = "PBR (actual / fitted)"),
+      zaxis = list(title = "Regime 0/1 (EBI ≤/> τ)"),
+      camera = list(eye = list(x = 1.6, y = 1.2, z = 0.9))
+    ),
+    title = paste0("3D Threshold Visualization — τ = ", round(tau, 2))
+  )
+
+  return(p)
+}
+
+# ==== GỌI HÀM (ví dụ) ====
+p3d <- plot3d_threshold(df, tau = 31.23)
+p3d
+```
+```{r}
+suppressPackageStartupMessages({library(dplyr); library(plotly)})
+
+# --- Fit once (OLS + FE dummies) ---
+tau <- 31.4
+fit_fe <- lm(PBR ~ EBI + I(pmax(EBI - tau, 0)) +
+               log_Population + Unemployment + log_GRDP +
+               factor(Province) + factor(Year),
+             data = df)
+
+# Coefs & control block at sample means
+b1 <- coef(fit_fe)[["EBI"]]
+b2 <- coef(fit_fe)[["I(pmax(EBI - tau, 0))"]]
+a0 <- coef(fit_fe)[["(Intercept)"]]
+
+Cbar <- with(df, c(log_Population = mean(log_Population, na.rm=TRUE),
+                   Unemployment   = mean(Unemployment,   na.rm=TRUE),
+                   log_GRDP       = mean(log_GRDP,       na.rm=TRUE)))
+g <- coef(fit_fe)[c("log_Population","Unemployment","log_GRDP")]
+ctrl_const <- sum(g * Cbar)
+
+# --- Build grid over EBI (x) and Regime y∈{0,1} ---
+x <- seq(quantile(df$EBI, .02, na.rm=TRUE),
+         quantile(df$EBI, .98, na.rm=TRUE), length.out = 80)
+y <- c(0,1)  # 0 = EBI ≤ τ, 1 = EBI > τ
+
+# z must be length(y) × length(x)
+z_mat <- rbind(
+  # Regime 0 sheet: (x - τ)_+ = 0
+  a0 + b1*x + ctrl_const,
+  # Regime 1 sheet: (x - τ)_+ = max(x-τ,0)
+  a0 + b1*x + b2*pmax(x - tau, 0) + ctrl_const
+)
+z_mat <- as.matrix(z_mat)  # ensure numeric matrix
+
+# Data points with regime flag
+pts <- df %>% mutate(Regime = as.integer(EBI > tau))
+
+# --- Plotly: two-sheet surface + points ---
+plot_ly() %>%
+  add_surface(x = ~x, y = ~y, z = ~z_mat,
+              opacity = 0.55, showscale = FALSE, name = "Model planes") %>%
+  add_markers(data = pts,
+              x = ~EBI, y = ~Regime, z = ~PBR,
+              marker = list(size = 3,
+                            color = ifelse(pts$Regime==1, "#c0392b", "#2e7d32")),
+              name = "Observed") %>%
+  layout(scene = list(
+           xaxis = list(title = "EBI"),
+           yaxis = list(title = "Regime (0 = EBI ≤ τ, 1 = EBI > τ)"),
+           zaxis = list(title = "PBR")
+         ),
+         legend = list(orientation = "h"))
+```
+```{r}
+# ---- data prep (adjust column names to yours if needed)
+d <- df |> dplyr::filter(is.finite(PBR), is.finite(EBI), is.finite(log_GRDP),
+                         is.finite(log_Population), is.finite(Unemployment))
+
+# center controls to keep predictions interpretable
+d <- d |> dplyr::mutate(
+  c_log_pop = log_Population - mean(log_Population, na.rm=TRUE),
+  c_unemp   = Unemployment   - mean(Unemployment,   na.rm=TRUE)
+)
+
+# ---- quadratic surface model (curved)
+m_poly <- lm(
+  PBR ~ EBI + I(EBI^2) + log_GRDP + I(log_GRDP^2) + EBI:log_GRDP +
+        c_log_pop + c_unemp + factor(Year),
+  data = d
+)
+
+# ---- prediction grid in (EBI, log_GRDP)
+nx <- 60; ny <- 60
+gx <- seq(quantile(d$EBI,      .02, na.rm=TRUE),
+          quantile(d$EBI,      .98, na.rm=TRUE), length.out = nx)
+gy <- seq(quantile(d$log_GRDP, .02, na.rm=TRUE),
+          quantile(d$log_GRDP, .98, na.rm=TRUE), length.out = ny)
+
+newg <- expand.grid(EBI=gx, log_GRDP=gy)
+newg$c_log_pop <- 0
+newg$c_unemp   <- 0
+# choose a reference year (or the most frequent)
+ref_year <- as.integer(names(sort(table(d$Year), decreasing=TRUE))[1])
+newg$Year <- ref_year
+
+# ---- get matrix Z for persp()
+pred <- predict(m_poly, newdata = newg)
+Z <- matrix(pred, nrow = nx, ncol = ny, byrow = FALSE)
+
+# ---- 3D surface (curved) with base graphics
+op <- par(mar=c(2.5,2.5,2,0.5))
+persp(gx, gy, Z,
+      theta = 35, phi = 25, expand = 0.8, shade = 0.5,
+      ticktype = "detailed",
+      xlab = "EBI", ylab = "log(GRDP)", zlab = "Predicted PBR",
+      col = "lightblue", border = NA)
+par(op)
+
+# ---- optional 2D heatmap + contour
+image(gx, gy, Z, col = hcl.colors(50, "Greens"), xlab="EBI", ylab="log(GRDP)")
+contour(gx, gy, Z, add = TRUE, drawlabels = FALSE)
+```
+```{r}
+# install.packages("mgcv")  # if not installed
+library(mgcv)
+
+m_gam <- gam(
+  PBR ~ s(EBI, log_GRDP, bs = "tp", k = 50) +  # curved surface in (EBI, log_GRDP)
+        c_log_pop + c_unemp + factor(Year),    # controls + year FE
+  data = d, method = "REML"
+)
+
+# predict on the same grid
+newg <- expand.grid(EBI=gx, log_GRDP=gy)
+newg$c_log_pop <- 0
+newg$c_unemp   <- 0
+newg$Year <- ref_year
+
+pred <- predict(m_gam, newdata = newg, type = "response")
+Z <- matrix(pred, nrow = nx, ncol = ny, byrow = FALSE)
+
+# 3D curved surface
+op <- par(mar=c(2.5,2.5,2,0.5))
+persp(gx, gy, Z,
+      theta = 35, phi = 25, expand = 0.8, shade = 0.5,
+      ticktype = "detailed",
+      xlab = "EBI", ylab = "log(GRDP)", zlab = "Predicted PBR",
+      col = "lightpink", border = NA)
+par(op)
+
+# 2D heatmap + contour
+image(gx, gy, Z, col = hcl.colors(50, "Magenta"), xlab="EBI", ylab="log(GRDP)")
+contour(gx, gy, Z, add = TRUE, drawlabels = FALSE)
+```
+

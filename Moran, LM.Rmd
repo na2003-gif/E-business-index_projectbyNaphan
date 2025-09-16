@@ -1,0 +1,200 @@
+---
+title: "Moran 1, LM test"
+author: "phanngocanhasd@gmail.com
+date: "2025-09-07"
+output: html_document
+---
+
+```{r}
+## ========= 0) Packages =========
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr)
+  library(sp); library(spdep)
+  library(plm); library(lmtest); library(sandwich)
+  library(ggplot2)
+})
+
+## ========= 1) Chuẩn bị panel cân bằng (N,T) =========
+# Yêu cầu df_raw có: Province, Year, Longitude, Latitude, PBR, EBI, GRDP, Population, Unemployment
+stopifnot(all(c("Province","Year","Longitude","Latitude",
+                "PBR","EBI","GRDP","Population","Unemployment") %in% names(df_raw)))
+
+df <- df_raw %>%
+  mutate(
+    Province     = as.character(Province),
+    Year         = as.integer(Year),
+    Longitude    = as.numeric(Longitude),
+    Latitude     = as.numeric(Latitude),
+    PBR          = as.numeric(PBR),
+    EBI          = as.numeric(EBI),
+    GRDP         = as.numeric(GRDP),
+    Population   = as.numeric(Population),
+    Unemployment = as.numeric(Unemployment),
+    log_GRDP       = log(GRDP),
+    log_Population = log(Population)
+  ) %>%
+  filter(is.finite(Longitude), is.finite(Latitude))
+
+# Lấy panel cân bằng theo đầy đủ năm hiện có
+years_all <- sort(unique(df$Year))
+vars_need <- c("PBR","EBI","log_GRDP","log_Population","Unemployment")
+
+prov_full <- df %>%
+  group_by(Province) %>% summarise(ok = all(years_all %in% Year), .groups="drop") %>%
+  filter(ok) %>% pull(Province)
+
+df_bal <- df %>%
+  filter(Province %in% prov_full) %>%
+  arrange(Province, Year) %>%
+  filter(complete.cases(across(all_of(vars_need))))
+
+N <- dplyr::n_distinct(df_bal$Province)
+Tt <- dplyr::n_distinct(df_bal$Year)
+message(sprintf("Balanced panel: N=%d, T=%d, rows=%d", N, Tt, nrow(df_bal)))
+stopifnot(nrow(df_bal) == N*Tt)
+
+## ========= 2) Tạo bảng toạ độ & GRDP_mean theo đúng thứ tự Province =========
+df_locs <- df_bal %>%
+  group_by(Province) %>%
+  summarise(
+    Longitude = first(Longitude),
+    Latitude  = first(Latitude),
+    GRDP_mean = mean(GRDP, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  tidyr::drop_na(Longitude, Latitude, GRDP_mean) %>%
+  arrange(Province)
+
+# Cố định thứ tự Province trong df_bal khớp df_locs
+df_bal$Province <- factor(df_bal$Province, levels = df_locs$Province)
+df_bal <- df_bal %>% arrange(Year, Province)
+
+## ========= 3) Ma trận khoảng cách & 2 trọng số =========
+coords <- as.matrix(df_locs[, c("Longitude","Latitude")])   # N x 2
+g_raw  <- df_locs$GRDP_mean                                 # N
+
+# Khoảng cách địa lý (km)
+D_km <- sp::spDists(coords, longlat = TRUE)
+D_km <- as.matrix(D_km)
+diag(D_km) <- NA_real_
+
+# --- (A) Geo: w_ij ∝ 1/d_ij^2, chuẩn hoá hàng ---
+W_geo_raw <- 1 / (D_km^2)
+W_geo_raw[!is.finite(W_geo_raw)] <- 0
+diag(W_geo_raw) <- 0
+W_geo <- W_geo_raw / pmax(rowSums(W_geo_raw), 1)
+lw_geo <- spdep::mat2listw(W_geo, style = "W", zero.policy = TRUE)
+
+# --- (B) Gravity: w_ij ∝ (g_i * g_j)/d_ij^2, với g>0 ---
+g_pos <- g_raw / median(g_raw, na.rm = TRUE)  # đảm bảo dương & cùng thang
+G <- tcrossprod(g_pos)                         # N x N
+
+W_grav_raw <- G / (D_km^2)
+W_grav_raw[!is.finite(W_grav_raw)] <- 0
+diag(W_grav_raw) <- 0
+stopifnot(!any(W_grav_raw < 0, na.rm = TRUE))
+
+W_grav <- W_grav_raw / pmax(rowSums(W_grav_raw), 1)
+lw_grav <- spdep::mat2listw(W_grav, style = "W", zero.policy = TRUE)
+
+cat(sprintf("OK: dim(D_km)=%dx%d; dim(G)=%dx%d\n",
+            nrow(D_km), ncol(D_km), nrow(G), ncol(G)))
+
+## ========= 4) Dựng W_panel (khối chéo I_T ⊗ W_N) =========
+make_panel_listw <- function(lwN, Tt){
+  Wn <- as(spdep::listw2mat(lwN), "dgCMatrix")  # N x N sparse
+  Wp <- Matrix::kronecker(Matrix::Diagonal(Tt), Wn)  # (N*T) x (N*T)
+  spdep::mat2listw(as.matrix(Wp), style = "W", zero.policy = TRUE)
+}
+lw_panel_geo  <- make_panel_listw(lw_geo,  Tt)
+lw_panel_grav <- make_panel_listw(lw_grav, Tt)
+
+## ========= 5) Pooled OLS (có year dummies) để lấy residual =========
+form_pooled <- PBR ~ EBI + log_GRDP + log_Population + Unemployment + factor(Year)
+ols_pool <- lm(form_pooled, data = df_bal)
+cat("\n=== OLS (pooled + year FE) ===\n"); print(summary(ols_pool))
+
+## ========= 6) Moran’s I trên residual (panel) =========
+# Residual xếp theo (Year, Province) đã khớp khối chéo W_panel
+u <- residuals(ols_pool)
+
+cat("\n=== Moran's I (Geo) on residuals ===\n")
+print(spdep::moran.test(u, lw_panel_geo, zero.policy = TRUE))
+
+cat("\n=== Moran's I (Gravity) on residuals ===\n")
+print(spdep::moran.test(u, lw_panel_grav, zero.policy = TRUE))
+
+## ========= 7) LM tests (Rao’s score) cho SAR/SEM/SARMA =========
+# Geo
+rs_geo  <- spdep::lm.RStests(ols_pool, lw_panel_geo,  test="all", zero.policy=TRUE)
+# Gravity
+rs_grav <- spdep::lm.RStests(ols_pool, lw_panel_grav, test="all", zero.policy=TRUE)
+
+getp <- function(h) if (inherits(h, "htest")) unname(h$p.value) else NA_real_
+
+rs_tbl <- data.frame(
+  W     = c("Geo","Gravity"),
+  RSerr = c(getp(rs_geo$RSerr),  getp(rs_grav$RSerr)),
+  RSlag = c(getp(rs_geo$RSlag),  getp(rs_grav$RSlag)),
+  SARMA = c(getp(rs_geo$SARMA),  getp(rs_grav$SARMA))
+)
+print(rs_tbl, row.names = FALSE)
+
+```
+```{r}
+## =========LM (Rao’s score) p-values — threshold model=========
+tau <- 31.2
+
+# Tạo biến ngưỡng theo Hansen (piecewise)
+df_thr <- df_bal %>%
+  dplyr::mutate(
+    x_pos = pmax(EBI - tau, 0)  # = 0 khi EBI <= tau; = EBI - tau khi EBI > tau
+  )
+
+## ========= 1) Pooled OLS (có year dummies) với biến ngưỡng =========
+form_thr <- PBR ~ EBI + x_pos + log_GRDP + log_Population + Unemployment + factor(Year)
+ols_thr  <- lm(form_thr, data = df_thr)
+
+cat("\n=== OLS (pooled + year FE) with threshold at tau = 31.2 ===\n")
+print(summary(ols_thr))
+
+# (tuỳ chọn) SE vững cụm theo tỉnh
+if (requireNamespace("sandwich", quietly = TRUE) &&
+    requireNamespace("lmtest", quietly = TRUE)) {
+  Vcl <- sandwich::vcovCL(ols_thr, cluster = df_thr$Province, type = "HC1")
+  cat("\n--- Coefficients with cluster-robust SE (by Province) ---\n")
+  print(lmtest::coeftest(ols_thr, vcov. = Vcl))
+}
+
+# Tính slope dưới/ trên ngưỡng theo piecewise
+b1 <- coef(ols_thr)["EBI"]
+b2 <- if ("x_pos" %in% names(coef(ols_thr))) coef(ols_thr)["x_pos"] else NA_real_
+
+cat(sprintf("\nSlope below tau : %.3f\n", b1))
+cat(sprintf("Slope above tau : %.3f\n", b1 + b2))
+
+## ========= 2) Moran’s I trên residual của mô hình ngưỡng =========
+u_thr <- residuals(ols_thr)
+
+cat("\n=== Moran's I (Geo) on residuals (threshold model) ===\n")
+print(spdep::moran.test(u_thr, lw_panel_geo, zero.policy = TRUE))
+
+cat("\n=== Moran's I (Gravity) on residuals (threshold model) ===\n")
+print(spdep::moran.test(u_thr, lw_panel_grav, zero.policy = TRUE))
+
+## ========= 3) LM (Rao’s score) tests cho SAR/SEM/SARMA (threshold model) =========
+rs_geo_thr  <- spdep::lm.RStests(ols_thr,  lw_panel_geo,  test = "all", zero.policy = TRUE)
+rs_grav_thr <- spdep::lm.RStests(ols_thr,  lw_panel_grav, test = "all", zero.policy = TRUE)
+
+getp <- function(h) if (inherits(h, "htest")) unname(h$p.value) else NA_real_
+
+rs_tbl_thr <- data.frame(
+  W     = c("Geo", "Gravity"),
+  RSerr = c(getp(rs_geo_thr$RSerr),   getp(rs_grav_thr$RSerr)),
+  RSlag = c(getp(rs_geo_thr$RSlag),   getp(rs_grav_thr$RSlag)),
+  SARMA = c(getp(rs_geo_thr$SARMA),   getp(rs_grav_thr$SARMA))
+)
+cat("\n=== LM (Rao’s score) p-values — threshold model ===\n")
+print(rs_tbl_thr, row.names = FALSE)
+```
+

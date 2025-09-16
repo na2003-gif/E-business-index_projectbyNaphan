@@ -1,0 +1,150 @@
+---
+title: "FE, RE"
+author: "phanngocanhasd@gmail.com"
+date: "2025-09-07"
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+---
+
+
+```{r}
+
+df <- Full_data_5_na_m_longtitude_
+
+df <- df %>% clean_names()
+
+print(names(df))
+
+df <- df %>%
+  mutate(
+    log_pop  = log(population),
+    log_grdp = log(grdp)
+  )
+
+df <- df %>% tidyr::drop_na(pbr, log_pop, unemployment, log_grdp)
+
+pdf <- pdata.frame(df, index = c("province","year"))
+
+# ======================
+# 1) Fixed Effects (FE) với SE robust
+# ======================
+fe_mod <- plm(
+  pbr ~ ebi + unemployment + log_grdp+ log_pop,
+  data = pdf, model = "within", effect = "individual"
+)
+
+# SE cluster theo tỉnh (group = province)
+se_clust <- vcovHC(fe_mod, type = "HC3", cluster = "group")
+cat("\n=== FE + Clustered (province) HC3 SE ===\n")
+print(coeftest(fe_mod, vcov = se_clust))
+
+# Driscoll–Kraay SE (tốt khi T nhỏ, có phụ thuộc chéo)
+se_dk <- vcovSCC(fe_mod, type = "HC3", maxlag = 1)
+cat("\n=== FE + Driscoll–Kraay (HC3) SE ===\n")
+print(coeftest(fe_mod, vcov = se_dk))
+
+# ======================
+# 2) Random Effects (RE) với SE robust
+# ======================
+re_mod <- plm(
+  pbr ~ ebi + unemployment + log_grdp+ log_pop,
+  data = pdf, model = "random"
+)
+
+se_clust_re <- vcovHC(re_mod, type = "HC3", cluster = "group")
+cat("\n=== RE + Clustered (province) HC3 SE ===\n")
+print(coeftest(re_mod, vcov = se_clust_re))
+
+se_dk_re <- vcovSCC(re_mod, type = "HC3", maxlag = 1)
+cat("\n=== RE + Driscoll–Kraay (HC3) SE ===\n")
+print(coeftest(re_mod, vcov = se_dk_re))
+
+# ======================
+# 3) Hausman Test (chọn FE hay RE ?)
+# ======================
+cat("\n=== Hausman test (FE vs RE) ===\n")
+print(phtest(fe_mod, re_mod))
+
+cat("\n=== pdim(pdf) (cấu trúc panel) ===\n")
+print(pdim(pdf))
+
+cat("\n=== FE summary (không robust SE) để xem R2, F, v.v. ===\n")
+print(summary(fe_mod))
+```
+
+```{r}
+# ========== Packages ==========
+pkgs <- c("plm","lmtest","sandwich","dplyr","janitor")
+new  <- pkgs[!(pkgs %in% installed.packages()[,"Package"])]
+if(length(new)) install.packages(new)
+invisible(lapply(pkgs, library, character.only=TRUE))
+
+# ========== Data ==========
+df <- Full_data_5_na_m_longtitude_ %>% clean_names() %>%
+  mutate(log_pop  = log(population),
+         log_grdp = log(grdp)) %>%
+  tidyr::drop_na(pbr, ebi, log_pop, unemployment, log_grdp)
+
+pdf <- pdata.frame(df, index=c("province","year"))
+
+# ========== Models ==========
+form  <- pbr ~ ebi +unemployment+ log_grdp + log_pop
+fe_mod <- plm(form, data=pdf, model="within", effect="individual")
+re_mod <- plm(form, data=pdf, model="random")
+
+# ========== SE objects ==========
+se_FE_HC <- vcovHC(fe_mod, type="HC3", cluster="group")
+se_FE_DK <- vcovSCC(fe_mod, type="HC3", maxlag=1)
+se_RE_HC <- vcovHC(re_mod, type="HC3", cluster="group")
+se_RE_DK <- vcovSCC(re_mod, type="HC3", maxlag=1)
+
+# ========== Helper: lấy coeftest và format "b (se)" ==========
+ct <- coeftest(fe_mod, vcov = se_clust)
+data.frame(
+  Variable   = rownames(ct),
+  Estimate   = ct[,1],
+  Std.Error  = ct[,2],
+  t.value    = ct[,3],
+  p.value    = ct[,4]
+)
+
+ct_FE_HC <- fmt_ct(fe_mod, se_FE_HC)
+ct_FE_DK <- fmt_ct(fe_mod, se_FE_DK)
+ct_RE_HC <- fmt_ct(re_mod, se_RE_HC)
+ct_RE_DK <- fmt_ct(re_mod, se_RE_DK)
+
+# Hợp nhất tất cả tên hệ số (FE không có intercept; RE có)
+all_vars <- Reduce(union, list(names(ct_FE_HC), names(ct_FE_DK),
+                               names(ct_RE_HC), names(ct_RE_DK)))
+
+# Hàm tiện điền giá trị theo all_vars (thiếu thì để rỗng)
+align_vec <- function(v, keys){
+  out <- rep("", length(keys)); names(out) <- keys
+  out[names(v)] <- v
+  out
+}
+
+tab <- data.frame(
+  Variable  = all_vars,
+  `FE-HC3`  = align_vec(ct_FE_HC, all_vars),
+  `FE-DK`   = align_vec(ct_FE_DK, all_vars),
+  `RE-HC3`  = align_vec(ct_RE_HC, all_vars),
+  `RE-DK`   = align_vec(ct_RE_DK, all_vars),
+  check.names = FALSE
+)
+
+# In bảng
+print(tab, row.names = FALSE)
+
+# ===== Thông tin bổ sung & Hausman =====
+cat("\n--- Panel structure ---\n")
+print(pdim(pdf))
+
+cat("\n--- Hausman test (FE vs RE) ---\n")
+print(phtest(fe_mod, re_mod))
+
+
+```
+
